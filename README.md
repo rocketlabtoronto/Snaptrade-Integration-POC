@@ -52,7 +52,10 @@ What this does:
 
 - Finds free ports automatically (no `.env` port configuration)
 - Starts the backend first, then the frontend
+- Waits for the backend process itself to be ready before starting the frontend
 - On Ctrl+C, stops both processes and releases the ports
+
+SnapTrade-dependent API actions still require valid credentials in `backend/.env`.
 
 ## Open in your browser
 

@@ -6,6 +6,7 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
 const {
   Snaptrade,
   AccountInformationApiGenerated,
@@ -182,42 +183,306 @@ app.use((req, res, next) => {
 // Simple in-memory store for user secrets (in production, use a proper database)
 const userSecrets = new Map();
 
-// SnapTrade credentials - use environment variables with fallbacks
-const SNAPTRADE_CLIENT_ID =
-  process.env.SNAPTRADE_CLIENT_ID;
-const SNAPTRADE_CONSUMER_KEY =
-  process.env.SNAPTRADE_CONSUMER_KEY;
-const FRONT_END_URL = process.env.FRONT_END_URL;
-
-// Initialize SnapTrade SDK (high-level client)
-const snaptrade = new Snaptrade({
-  clientId: SNAPTRADE_CLIENT_ID,
-  consumerKey: SNAPTRADE_CONSUMER_KEY,
-});
-
-// Some SDK endpoints are implemented on the generated API classes.
-// We must pass consumerKey into the generated Configuration for auth to work.
-const generatedConfig = new Configuration({
-  // Critical: the generated API client uses Configuration.consumerKey for auth.
-  consumerKey: SNAPTRADE_CONSUMER_KEY,
-  basePath: snaptrade.configuration?.basePath,
-  baseOptions: snaptrade.configuration?.baseOptions,
-});
-const accountInformationApi = new AccountInformationApiGenerated(
-  generatedConfig
+const SNAPTRADE_ENV_VALUES = ["production", "development"];
+const DEFAULT_SNAPTRADE_ENV = normalizeSnapTradeEnv(
+  process.env.SNAPTRADE_ENV || "production"
 );
+const FRONT_END_URL = process.env.FRONT_END_URL;
+const SUPABASE_TABLE = "snaptrade_users";
 
-const referenceDataApi = new ReferenceDataApiGenerated(generatedConfig);
+const SNAPTRADE_ENVIRONMENTS = {
+  production: {
+    clientId:
+      process.env.SNAPTRADE_PRODUCTION_CLIENT_ID ||
+      process.env.SNAPTRADE_CLIENT_ID ||
+      null,
+    consumerKey:
+      process.env.SNAPTRADE_PRODUCTION_CONSUMER_KEY ||
+      process.env.SNAPTRADE_CONSUMER_KEY ||
+      null,
+  },
+  development: {
+    clientId: process.env.SNAPTRADE_DEVELOPMENT_CLIENT_ID || null,
+    consumerKey: process.env.SNAPTRADE_DEVELOPMENT_CONSUMER_KEY || null,
+  },
+};
 
-// Test API credentials (quick health check used by the UI and startup logs)
+const snaptradeContexts = new Map();
+const SUPABASE_ENVIRONMENTS = {
+  production: {
+    url:
+      process.env.SUPABASE_PRODUCTION_URL ||
+      process.env.NEXT_PUBLIC_SUPABASE_URL ||
+      null,
+    key:
+      process.env.SUPABASE_PRODUCTION_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_PRODUCTION_ANON_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY ||
+      null,
+  },
+  development: {
+    url:
+      process.env.SUPABASE_DEVELOPMENT_URL ||
+      process.env.REACT_APP_SUPABASE_URL ||
+      null,
+    key:
+      process.env.SUPABASE_DEVELOPMENT_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_DEVELOPMENT_ANON_KEY ||
+      process.env.REACT_APP_SUPABASE_ANON_KEY ||
+      null,
+  },
+};
+const supabaseClients = new Map();
+
+function createHttpError(statusCode, message, details) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  if (details !== undefined) {
+    error.details = details;
+  }
+  return error;
+}
+
+function normalizeSnapTradeEnv(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!SNAPTRADE_ENV_VALUES.includes(normalized)) {
+    throw createHttpError(
+      400,
+      `Invalid SnapTrade environment: ${value || "(missing)"}`
+    );
+  }
+  return normalized;
+}
+
+function getRequestedSnapTradeEnv(req) {
+  return normalizeSnapTradeEnv(
+    req?.body?.snaptradeEnv ||
+      req?.query?.snaptradeEnv ||
+      req?.headers?.["x-snaptrade-env"] ||
+      DEFAULT_SNAPTRADE_ENV
+  );
+}
+
+function getSnapTradeEnvironmentConfig(envName) {
+  return SNAPTRADE_ENVIRONMENTS[normalizeSnapTradeEnv(envName)];
+}
+
+function isSnapTradeEnvironmentConfigured(envName) {
+  const config = getSnapTradeEnvironmentConfig(envName);
+  return Boolean(config?.clientId && config?.consumerKey);
+}
+
+function getSupabaseEnvironmentConfig(envName) {
+  return SUPABASE_ENVIRONMENTS[normalizeSnapTradeEnv(envName)];
+}
+
+function buildSupabaseClient(envName) {
+  const normalizedEnv = normalizeSnapTradeEnv(envName);
+  const credentials = getSupabaseEnvironmentConfig(normalizedEnv);
+
+  if (!credentials?.url || !credentials?.key) {
+    return null;
+  }
+
+  if (supabaseClients.has(normalizedEnv)) {
+    return supabaseClients.get(normalizedEnv);
+  }
+
+  const client = createClient(credentials.url, credentials.key);
+  supabaseClients.set(normalizedEnv, client);
+  return client;
+}
+
+function getUserSecretKey(envName, userId) {
+  return `${envName}:${userId}`;
+}
+
+function getStoredUserSecret(envName, userId) {
+  return userSecrets.get(getUserSecretKey(envName, userId)) || null;
+}
+
+function setStoredUserSecret(envName, userId, userSecret) {
+  userSecrets.set(getUserSecretKey(envName, userId), userSecret);
+}
+
+function removeStoredUserSecret(envName, userId) {
+  userSecrets.delete(getUserSecretKey(envName, userId));
+}
+
+function buildSnaptradeContext(envName) {
+  const normalizedEnv = normalizeSnapTradeEnv(envName);
+  const credentials = getSnapTradeEnvironmentConfig(normalizedEnv);
+
+  if (!credentials?.clientId || !credentials?.consumerKey) {
+    throw createHttpError(
+      409,
+      `${normalizedEnv[0].toUpperCase()}${normalizedEnv.slice(1)} SnapTrade credentials are not configured yet.`
+    );
+  }
+
+  if (snaptradeContexts.has(normalizedEnv)) {
+    return snaptradeContexts.get(normalizedEnv);
+  }
+
+  const snaptrade = new Snaptrade({
+    clientId: credentials.clientId,
+    consumerKey: credentials.consumerKey,
+  });
+
+  const generatedConfig = new Configuration({
+    consumerKey: credentials.consumerKey,
+    basePath: snaptrade.configuration?.basePath,
+    baseOptions: snaptrade.configuration?.baseOptions,
+  });
+
+  const context = {
+    envName: normalizedEnv,
+    credentials,
+    snaptrade,
+    accountInformationApi: new AccountInformationApiGenerated(generatedConfig),
+    referenceDataApi: new ReferenceDataApiGenerated(generatedConfig),
+  };
+
+  snaptradeContexts.set(normalizedEnv, context);
+  return context;
+}
+
+function ensureSupabaseConfigured(envName) {
+  const client = buildSupabaseClient(envName);
+  if (!client) {
+    throw createHttpError(
+      500,
+      `${normalizeSnapTradeEnv(envName)[0].toUpperCase()}${normalizeSnapTradeEnv(envName).slice(1)} Supabase persistence is not configured. Provide environment-specific Supabase credentials for this SnapTrade environment before rotating secrets.`
+    );
+  }
+  return client;
+}
+
+async function ensureSupabaseUserExists(envName, userId) {
+  const client = ensureSupabaseConfigured(envName);
+  const cachedUserSecret = getStoredUserSecret(envName, userId);
+  const { data, error } = await client
+    .from(SUPABASE_TABLE)
+    .select("id, snaptrade_user_id, snaptrade_user_secret")
+    .eq("snaptrade_user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    throw createHttpError(
+      500,
+      `Failed to verify Supabase record for ${userId}`,
+      error
+    );
+  }
+
+  if (!data) {
+    const seededSecret = cachedUserSecret || crypto.randomUUID();
+    const { data: insertedData, error: insertError } = await client
+      .from(SUPABASE_TABLE)
+      .insert({
+        snaptrade_user_id: userId,
+        snaptrade_user_secret: seededSecret,
+      })
+      .select("id, snaptrade_user_id, snaptrade_user_secret")
+      .single();
+
+    if (insertError) {
+      throw createHttpError(
+        500,
+        `Failed to create missing Supabase record for ${userId}`,
+        insertError
+      );
+    }
+
+    return {
+      ...insertedData,
+      seeded: true,
+      canAuthenticateWithSnapTrade: Boolean(cachedUserSecret),
+    };
+  }
+
+  return {
+    ...data,
+    seeded: false,
+    canAuthenticateWithSnapTrade: Boolean(
+      cachedUserSecret || data.snaptrade_user_secret
+    ),
+  };
+}
+
+async function updateSupabaseUserSecret(envName, userId, userSecret) {
+  const client = ensureSupabaseConfigured(envName);
+  const { data, error } = await client
+    .from(SUPABASE_TABLE)
+    .update({ snaptrade_user_secret: userSecret })
+    .eq("snaptrade_user_id", userId)
+    .select("snaptrade_user_id, snaptrade_user_secret")
+    .maybeSingle();
+
+  if (error) {
+    throw createHttpError(
+      500,
+      `Failed to update Supabase secret for ${userId}`,
+      error
+    );
+  }
+
+  if (!data) {
+    throw createHttpError(
+      500,
+      `Supabase did not return an updated row for ${userId}`
+    );
+  }
+
+  return data;
+}
+
+async function maybeUpsertSupabaseUserSecret(envName, userId, userSecret) {
+  const client = buildSupabaseClient(envName);
+  if (!client) {
+    return null;
+  }
+
+  const { error } = await client
+    .from(SUPABASE_TABLE)
+    .upsert(
+      {
+        snaptrade_user_id: userId,
+        snaptrade_user_secret: userSecret,
+      },
+      { onConflict: "snaptrade_user_id" }
+    );
+
+  if (error) {
+    console.error("[SUPABASE] Failed to upsert SnapTrade user secret", {
+      userId,
+      error,
+    });
+  }
+
+  return true;
+}
+
+// Lightweight readiness probe for local startup orchestration.
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Backend server is running",
+  });
+});
+
+// Test API credentials without conflating that with server readiness.
 app.get("/api/status", async (req, res) => {
   try {
-    console.log("Testing SnapTrade API credentials...");
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
+    console.log(`Testing SnapTrade API credentials for ${envName}...`);
     const response = await snaptrade.apiStatus.check();
     console.log("API Status Check Success:", response.data);
     res.json({
       status: "success",
       message: "SnapTrade API credentials are valid",
+      snaptradeEnv: envName,
       data: response.data,
     });
   } catch (error) {
@@ -234,21 +499,39 @@ app.get("/api/status", async (req, res) => {
 
 // Debug endpoint: verifies required config is present WITHOUT returning secrets.
 app.get("/api/config-check", (req, res) => {
+  const requestedEnv = getRequestedSnapTradeEnv(req);
   res.json({
-    snaptradeClientIdPresent: Boolean(SNAPTRADE_CLIENT_ID),
-    snaptradeConsumerKeyPresent: Boolean(SNAPTRADE_CONSUMER_KEY),
-    // Safe fingerprints for comparison across environments
-    snaptradeClientIdFingerprint: fingerprint(SNAPTRADE_CLIENT_ID),
-    snaptradeConsumerKeyFingerprint: fingerprint(SNAPTRADE_CONSUMER_KEY),
-    snaptradeClientIdMasked: maskLast(SNAPTRADE_CLIENT_ID, 6),
-    snaptradeConsumerKeyMasked: maskLast(SNAPTRADE_CONSUMER_KEY, 6),
-    frontEndUrl: FRONT_END_URL,
+    snaptradeEnv: requestedEnv,
+    availableEnvironments: Object.fromEntries(
+      SNAPTRADE_ENV_VALUES.map((envName) => {
+        const credentials = getSnapTradeEnvironmentConfig(envName);
+        const supabaseConfig = getSupabaseEnvironmentConfig(envName);
+        return [
+          envName,
+          {
+            configured: isSnapTradeEnvironmentConfigured(envName),
+            clientId: credentials?.clientId || null,
+            consumerKey: credentials?.consumerKey || null,
+            supabaseUrl: supabaseConfig?.url || null,
+            supabaseKey: supabaseConfig?.key || null,
+            clientIdMasked: maskLast(credentials?.clientId, 6),
+            consumerKeyMasked: maskLast(credentials?.consumerKey, 6),
+            supabaseKeyMasked: maskLast(supabaseConfig?.key, 6),
+            clientIdFingerprint: fingerprint(credentials?.clientId),
+            consumerKeyFingerprint: fingerprint(credentials?.consumerKey),
+            supabaseKeyFingerprint: fingerprint(supabaseConfig?.key),
+          },
+        ];
+      })
+    ),
   });
 });
 
 // List available brokerages (reference data)
 app.get("/api/brokerages", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { referenceDataApi } = buildSnaptradeContext(envName);
     const response = await referenceDataApi.listAllBrokerages();
     res.json(response.data);
   } catch (error) {
@@ -262,13 +545,15 @@ app.get("/api/brokerages", async (req, res) => {
 // List all users (and attach any locally stored userSecret for dev convenience)
 app.get("/api/users", async (req, res) => {
   try {
-    console.log("Attempting to list SnapTrade users...");
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
+    console.log(`Attempting to list SnapTrade users for ${envName}...`);
     const response = await snaptrade.authentication.listSnapTradeUsers();
 
     // Transform the response to include user secrets
     const usersWithSecrets = response.data.map((userId) => ({
       userId: userId,
-      userSecret: userSecrets.get(userId) || null,
+      userSecret: getStoredUserSecret(envName, userId),
     }));
 
     res.json(usersWithSecrets);
@@ -284,6 +569,8 @@ app.get("/api/users", async (req, res) => {
 // Register new user
 app.post("/api/users", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
     const { userId } = req.body;
 
     if (!userId) {
@@ -306,9 +593,13 @@ app.post("/api/users", async (req, res) => {
     });
 
     // Store the user secret for future use
-    userSecrets.set(userId, response.data.userSecret);
+    setStoredUserSecret(envName, userId, response.data.userSecret);
+    await maybeUpsertSupabaseUserSecret(envName, userId, response.data.userSecret);
 
-    res.json(response.data);
+    res.json({
+      ...response.data,
+      snaptradeEnv: envName,
+    });
   } catch (error) {
     logAxiosLikeError("SnapTrade POST /api/users", error);
     res.status(error.response?.status || 500).json({
@@ -320,10 +611,13 @@ app.post("/api/users", async (req, res) => {
 // Delete user
 app.delete("/api/users/:userId", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
     const { userId } = req.params;
     const response = await snaptrade.authentication.deleteSnapTradeUser({
       userId: userId,
     });
+    removeStoredUserSecret(envName, userId);
     res.json(response.data);
   } catch (error) {
     logAxiosLikeError("SnapTrade DELETE /api/users/:userId", error);
@@ -336,6 +630,8 @@ app.delete("/api/users/:userId", async (req, res) => {
 // Generate connection with userId and userSecret in URL (for testing only)
 app.get("/api/users/:userId/:userSecret/login", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
     const { userId, userSecret } = req.params;
     if (!userId || !userSecret) {
       return res
@@ -366,14 +662,17 @@ app.get("/api/users/:userId/:userSecret/login", async (req, res) => {
 // stored locally (e.g., browser localStorage) for dev/admin-only usage.
 app.post("/api/users/login", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade, credentials } = buildSnaptradeContext(envName);
     const { userId, userSecret } = req.body || {};
 
     console.log("[LOGIN] Incoming request", {
+      snaptradeEnv: envName,
       userId,
       userSecretPresent: Boolean(userSecret),
       userSecretFingerprint: fingerprint(userSecret),
-      snaptradeConsumerKeyPresent: Boolean(SNAPTRADE_CONSUMER_KEY),
-      snaptradeConsumerKeyFingerprint: fingerprint(SNAPTRADE_CONSUMER_KEY),
+      snaptradeConsumerKeyPresent: Boolean(credentials.consumerKey),
+      snaptradeConsumerKeyFingerprint: fingerprint(credentials.consumerKey),
     });
 
     if (!userId || !userSecret) {
@@ -401,13 +700,16 @@ app.post("/api/users/login", async (req, res) => {
 // Body: { userId, userSecret }
 app.post("/api/users/accounts", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade, credentials } = buildSnaptradeContext(envName);
     const { userId, userSecret } = req.body || {};
 
     console.log("[ACCOUNTS] Incoming request", {
+      snaptradeEnv: envName,
       userId,
       userSecret: userSecret,
-      snaptradeClientId: SNAPTRADE_CLIENT_ID,
-      snaptradeConsumerKey: SNAPTRADE_CONSUMER_KEY
+      snaptradeClientId: credentials.clientId,
+      snaptradeConsumerKey: credentials.consumerKey
     });
 
 
@@ -461,9 +763,12 @@ app.post("/api/users/accounts", async (req, res) => {
 // Body: { accountId, userId, userSecret }
 app.post("/api/users/holdings", async (req, res) => {
   try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
     const { accountId, userId, userSecret } = req.body || {};
 
     console.log("[HOLDINGS] Incoming request", {
+      snaptradeEnv: envName,
       accountId,
       userId,
       userSecret: userSecret
@@ -499,6 +804,72 @@ app.post("/api/users/holdings", async (req, res) => {
   }
 });
 
+// Rotate a SnapTrade user secret and persist it to Supabase before returning it to the UI.
+app.post("/api/users/rotate-secret", async (req, res) => {
+  let rotatedSecret = null;
+
+  try {
+    const envName = getRequestedSnapTradeEnv(req);
+    const { snaptrade } = buildSnaptradeContext(envName);
+    const { userId } = req.body || {};
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const supabaseRecord = await ensureSupabaseUserExists(envName, userId);
+    const currentUserSecret =
+      getStoredUserSecret(envName, userId) ||
+      supabaseRecord?.snaptrade_user_secret ||
+      null;
+
+    if (!currentUserSecret || !supabaseRecord?.canAuthenticateWithSnapTrade) {
+      throw createHttpError(
+        409,
+        `Created a Supabase row for ${userId}, but the current SnapTrade user secret is unknown. Rotation cannot proceed until the real existing secret is available.`
+      );
+    }
+
+    const response = await snaptrade.authentication.resetSnapTradeUserSecret({
+      userId,
+      userSecret: currentUserSecret,
+    });
+
+    rotatedSecret = response?.data?.userSecret;
+    if (!rotatedSecret) {
+      throw createHttpError(
+        502,
+        `SnapTrade did not return a rotated secret for ${userId}`
+      );
+    }
+
+    await updateSupabaseUserSecret(envName, userId, rotatedSecret);
+    setStoredUserSecret(envName, userId, rotatedSecret);
+
+    res.json({
+      userId,
+      userSecret: rotatedSecret,
+      snaptradeEnv: envName,
+      persistedToSupabase: true,
+    });
+  } catch (error) {
+    if (rotatedSecret) {
+      console.error(
+        "[ROTATE] SnapTrade returned a rotated secret but persistence failed. Manual recovery may be required.",
+        {
+          userSecretFingerprint: fingerprint(rotatedSecret),
+          details: error?.details || null,
+        }
+      );
+    }
+
+    logAxiosLikeError("SnapTrade POST /api/users/rotate-secret", error);
+    res.status(error.statusCode || error.response?.status || 500).json({
+      error: error?.details || error?.response?.data || error?.message,
+    });
+  }
+});
+
 // Last-resort Express error handler
 app.use((err, req, res, next) => {
   console.error("\n[EXPRESS] Unhandled error:");
@@ -511,8 +882,10 @@ app.use((err, req, res, next) => {
 // Boot server and run a startup health check for SnapTrade credentials.
 const server = app.listen(PORT, () => {
   const actualPort = server.address()?.port;
+  const startupEnv = DEFAULT_SNAPTRADE_ENV;
   console.log(`Backend proxy server running on http://localhost:${actualPort}`);
   console.log("Available endpoints:");
+  console.log("  GET /api/health - Backend readiness check");
   console.log("  GET /api/status - Test SnapTrade API credentials");
   console.log("  GET /api/users - List all users");
   console.log("  POST /api/users - Register new user");
@@ -521,16 +894,22 @@ const server = app.listen(PORT, () => {
   console.log("  POST /api/users/login - Generate connection (body contains userSecret)");
   console.log("  POST /api/users/accounts - List connected accounts (body contains userSecret)");
   console.log("  POST /api/users/holdings - Get holdings across accounts (body contains userSecret)");
+  console.log("  POST /api/users/rotate-secret - Rotate user secret and persist it to Supabase");
 
-  console.log(`\n🔑 Using SnapTrade Client ID: ${SNAPTRADE_CLIENT_ID}`);
-  console.log(
-    `📄 Credentials source: ${
-      process.env.SNAPTRADE_CLIENT_ID ? ".env file" : "hardcoded fallbacks"
-    }`
-  );
-  console.log("🔧 Testing SnapTrade API credentials on startup...");
-  // Test API credentials on startup
-  snaptrade.apiStatus
+  console.log(`\n🌐 SnapTrade startup environment: ${startupEnv}`);
+
+  if (!isSnapTradeEnvironmentConfigured(startupEnv)) {
+    console.log(
+      `⚠️ ${startupEnv} SnapTrade credentials are not configured yet. Startup readiness is still available via /api/health.`
+    );
+    return;
+  }
+
+  const startupContext = buildSnaptradeContext(startupEnv);
+  console.log(`🔑 Using SnapTrade Client ID: ${startupContext.credentials.clientId}`);
+  console.log("📄 Credentials source: .env file");
+  console.log(`🔧 Testing SnapTrade API credentials on startup for ${startupEnv}...`);
+  startupContext.snaptrade.apiStatus
     .check()
     .then((response) => {
       console.log("✅ SnapTrade API credentials are VALID");

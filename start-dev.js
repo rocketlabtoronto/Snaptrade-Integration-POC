@@ -124,7 +124,7 @@ async function killProcessOnPort(port) {
 async function waitForBackend(maxRetries = 30) {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      await axios.get(`${BACKEND_URL}/api/status`);
+      await axios.get(`${BACKEND_URL}/api/health`);
       log("STARTUP", "Backend is ready!", colors.green);
       return true;
     } catch (error) {

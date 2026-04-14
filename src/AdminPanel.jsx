@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
-import { fetchUserHoldings, normalizeHoldingsResponse } from "./holdings";
+import { normalizeHoldingsResponse } from "./holdings";
+
+const SNAPTRADE_ENV_OPTIONS = [
+  { value: "production", label: "Production" },
+  { value: "development", label: "Development" },
+];
 
 // Use environment variable for API base URL - fail if not set
 const API_BASE = process.env.REACT_APP_API_BASE_URL;
@@ -19,6 +24,12 @@ if (!API_BASE) {
  */
 export default function AdminPanel() {
   const [users, setUsers] = useState([]);
+  const [appConfig, setAppConfig] = useState(null);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configError, setConfigError] = useState(null);
+  const [selectedSnaptradeEnv, setSelectedSnaptradeEnv] = useState("production");
+  const [userConnectionStatus, setUserConnectionStatus] = useState({});
+  const [statusLoading, setStatusLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [newUserId, setNewUserId] = useState("");
@@ -32,6 +43,8 @@ export default function AdminPanel() {
   const [connectionUrl, setConnectionUrl] = useState(null);
   const [connectionLoading, setConnectionLoading] = useState(false);
   const [connectionErrorDetails, setConnectionErrorDetails] = useState(null);
+  const [rotatingUserId, setRotatingUserId] = useState(null);
+  const [rotationFeedback, setRotationFeedback] = useState(null);
 
   const [brokerages, setBrokerages] = useState([]);
   const [brokeragesLoading, setBrokeragesLoading] = useState(false);
@@ -48,6 +61,11 @@ export default function AdminPanel() {
   const [holdingsError, setHoldingsError] = useState(null);
   const [holdingsErrorDetails, setHoldingsErrorDetails] = useState(null);
   const [holdingsData, setHoldingsData] = useState(null);
+
+  const selectedEnvironmentConfig =
+    appConfig?.availableEnvironments?.[selectedSnaptradeEnv] || null;
+
+  const appMode = selectedSnaptradeEnv === "production" ? "Production" : "Development";
 
   /**
    * Return the first non-empty string from a list of candidates.
@@ -144,8 +162,31 @@ export default function AdminPanel() {
 
   // ---- Local secret storage (dev/admin-only) ----
   // We store userSecrets in localStorage so Generate Portal still works after backend restarts.
-  // Shape: { [userId: string]: userSecret: string }
+  // Shape: { production: { [userId]: userSecret }, development: { [userId]: userSecret } }
   const USER_SECRETS_KEY = "snaptrade_userSecrets_v1";
+
+  const normalizeLocalSecrets = (value) => {
+    if (!value || typeof value !== "object") {
+      return { production: {}, development: {} };
+    }
+
+    const hasScopedEnvs = SNAPTRADE_ENV_OPTIONS.some(
+      ({ value: envName }) => value?.[envName] && typeof value[envName] === "object"
+    );
+
+    if (hasScopedEnvs) {
+      return {
+        production: value.production && typeof value.production === "object" ? value.production : {},
+        development:
+          value.development && typeof value.development === "object" ? value.development : {},
+      };
+    }
+
+    return {
+      production: value,
+      development: {},
+    };
+  };
 
   /**
    * Load locally stored user secrets from browser storage.
@@ -154,20 +195,28 @@ export default function AdminPanel() {
   const loadLocalSecrets = () => {
     try {
       const raw = localStorage.getItem(USER_SECRETS_KEY);
-      if (!raw) return {};
+      if (!raw) return { production: {}, development: {} };
       const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? parsed : {};
+      return normalizeLocalSecrets(parsed);
     } catch {
-      return {};
+      return { production: {}, development: {} };
     }
   };
 
   /**
    * Save a userSecret to localStorage keyed by userId.
    */
-  const saveLocalSecret = (userId, userSecret) => {
+  const saveLocalSecret = (envName, userId, userSecret) => {
     try {
-      const next = { ...loadLocalSecrets(), [userId]: userSecret };
+      const normalizedEnv = envName === "development" ? "development" : "production";
+      const current = loadLocalSecrets();
+      const next = {
+        ...current,
+        [normalizedEnv]: {
+          ...(current?.[normalizedEnv] || {}),
+          [userId]: userSecret,
+        },
+      };
       localStorage.setItem(USER_SECRETS_KEY, JSON.stringify(next));
     } catch {
       // ignore localStorage failures
@@ -177,9 +226,10 @@ export default function AdminPanel() {
   /**
    * Read a userSecret from localStorage (if present).
    */
-  const getLocalSecret = (userId) => {
+  const getLocalSecret = (envName, userId) => {
     const map = loadLocalSecrets();
-    return map?.[userId] || null;
+    const normalizedEnv = envName === "development" ? "development" : "production";
+    return map?.[normalizedEnv]?.[userId] || null;
   };
 
   /**
@@ -194,17 +244,271 @@ export default function AdminPanel() {
   // we override the outbound userId used for SnapTrade calls.
   const getSecretUserId = (rowUserId) => rowUserId;
 
+  const getEnvironmentLabel = (envName) =>
+    SNAPTRADE_ENV_OPTIONS.find((option) => option.value === envName)?.label ||
+    envName;
+
+  const fetchAppConfig = async (envName = selectedSnaptradeEnv) => {
+    setConfigLoading(true);
+    setConfigError(null);
+    try {
+      const res = await axios.get(`${API_BASE}/config-check`, {
+        params: { _ts: Date.now(), snaptradeEnv: envName },
+      });
+      setAppConfig(res.data || null);
+      return res.data || null;
+    } catch (err) {
+      setConfigError(
+        err.response?.data?.error || err.message || "Failed to load app configuration"
+      );
+      setAppConfig(null);
+      return null;
+    } finally {
+      setConfigLoading(false);
+    }
+  };
+
+  const buildStatusErrorMessage = (err) => {
+    const rawMessage =
+      err?.response?.data?.error ||
+      err?.response?.data?.message ||
+      err?.message ||
+      "Unable to determine connection status";
+
+    if (rawMessage === "User secret not found locally. Please re-register this user.") {
+      return "No local user secret is stored in this browser yet.";
+    }
+
+    return rawMessage;
+  };
+
+  const fetchUserConnectionStatuses = async (
+    userList,
+    envName = selectedSnaptradeEnv
+  ) => {
+    if (!Array.isArray(userList) || userList.length === 0) {
+      setUserConnectionStatus({});
+      return;
+    }
+
+    setStatusLoading(true);
+    setUserConnectionStatus(
+      Object.fromEntries(
+        userList.map((user) => [
+          user.userId,
+          {
+            state: "checking",
+            label: "Checking",
+            detail: "Checking connected accounts...",
+            accountCount: 0,
+          },
+        ])
+      )
+    );
+
+    const nextStatuses = await Promise.all(
+      userList.map(async (user) => {
+        const userSecret = user.userSecret || getLocalSecret(envName, user.userId);
+
+        if (!userSecret) {
+          return [
+            user.userId,
+            {
+              state: "disconnected",
+              label: "Disconnected",
+              detail:
+                "Not available (re-register) means this browser does not have the SnapTrade user secret cached for this user, so portal generation and account checks cannot run until you re-register here.",
+              accountCount: 0,
+              needsReregistration: true,
+            },
+          ];
+        }
+
+        try {
+          const res = await axios.post(`${API_BASE}/users/accounts`, {
+            userId: user.userId,
+            userSecret,
+            snaptradeEnv: envName,
+          });
+
+          const accounts = Array.isArray(res.data) ? res.data : [];
+
+          if (accounts.length > 0) {
+            return [
+              user.userId,
+              {
+                state: "connected",
+                label: "Connected",
+                detail: `${accounts.length} connected account${
+                  accounts.length === 1 ? "" : "s"
+                } found.`,
+                accountCount: accounts.length,
+                needsReregistration: false,
+              },
+            ];
+          }
+
+          return [
+            user.userId,
+            {
+              state: "disconnected",
+              label: "Disconnected",
+              detail: "User exists in SnapTrade, but no connected brokerage accounts were returned yet.",
+              accountCount: 0,
+              needsReregistration: false,
+            },
+          ];
+        } catch (err) {
+          return [
+            user.userId,
+            {
+              state: "disconnected",
+              label: "Disconnected",
+              detail: buildStatusErrorMessage(err),
+              accountCount: 0,
+              needsReregistration: false,
+            },
+          ];
+        }
+      })
+    );
+
+    setUserConnectionStatus(Object.fromEntries(nextStatuses));
+    setStatusLoading(false);
+  };
+
+  const getUserStatus = (user) => {
+    const status = userConnectionStatus?.[user.userId];
+    if (status) return status;
+
+    return {
+      state: "checking",
+      label: "Checking",
+      detail: "Checking connected accounts...",
+      accountCount: 0,
+      needsReregistration: !user.userSecret,
+    };
+  };
+
+  const connectedUsers = users.filter(
+    (user) => getUserStatus(user).state === "connected"
+  );
+
+  const disconnectedUsers = users.filter(
+    (user) => getUserStatus(user).state !== "connected"
+  );
+
+  const renderUserTable = (userList) => {
+    if (!userList.length) {
+      return null;
+    }
+
+    return (
+      <table className="min-w-full bg-white border border-gray-300">
+        <thead>
+          <tr>
+            <th className="border px-4 py-2">User ID</th>
+            <th className="border px-4 py-2">Status</th>
+            <th className="border px-4 py-2">User Secret</th>
+            <th className="border px-4 py-2">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {userList.map((user) => {
+            const status = getUserStatus(user);
+            const isSelected = selectedUser === user.userId;
+            const statusClasses =
+              status.state === "connected"
+                ? "bg-green-100 text-green-800"
+                : status.state === "checking"
+                ? "bg-amber-100 text-amber-800"
+                : "bg-slate-100 text-slate-700";
+
+            return (
+              <tr key={user.userId} className={isSelected ? "bg-blue-50" : ""}>
+                <td className="border px-4 py-2 align-top">{user.userId}</td>
+                <td className="border px-4 py-2 align-top">
+                  <div className="space-y-1">
+                    <span
+                      className={`inline-flex rounded-full px-2 py-1 text-xs font-semibold ${statusClasses}`}
+                    >
+                      {status.label}
+                    </span>
+                    <div className="text-xs text-gray-600">{status.detail}</div>
+                  </div>
+                </td>
+                <td className="border px-4 py-2 align-top">
+                  {user.userSecret ? (
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-xs bg-gray-100 px-2 py-1 rounded">
+                        {user.userSecret.substring(0, 8)}...
+                      </span>
+                      <button
+                        onClick={() => navigator.clipboard.writeText(user.userSecret)}
+                        className="bg-gray-500 text-white px-2 py-1 rounded text-xs hover:bg-gray-600"
+                        title="Copy full secret"
+                      >
+                        Copy
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      <span className="text-red-500 text-sm">Not available (re-register)</span>
+                      <div className="text-xs text-gray-600">
+                        This browser is missing the userSecret for this SnapTrade user.
+                      </div>
+                    </div>
+                  )}
+                </td>
+                <td className="border px-4 py-2 align-top">
+                  <div className="flex flex-col items-start gap-2">
+                  <button
+                    className="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 disabled:bg-gray-400"
+                    onClick={() => generateConnection(user.userId)}
+                    disabled={
+                      (connectionLoading && selectedUser === user.userId) ||
+                      !user.userSecret
+                    }
+                  >
+                    {connectionLoading && selectedUser === user.userId
+                      ? "Generating..."
+                      : "Generate Portal"}
+                  </button>
+                  <button
+                    className="bg-amber-500 text-white px-3 py-1 rounded hover:bg-amber-600 disabled:bg-gray-400"
+                    onClick={() => rotateUserSecret(user.userId)}
+                    disabled={rotatingUserId === user.userId || !selectedEnvironmentConfig?.configured}
+                    title="Rotates the secret for the SnapTrade user. Use this only if the userSecret is believed to be compromised."
+                  >
+                    {rotatingUserId === user.userId ? "Rotating..." : "Rotate User Secret"}
+                  </button>
+                  <button
+                    className="bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600"
+                    onClick={() => deleteUser(user.userId)}
+                  >
+                    Delete
+                  </button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    );
+  };
+
   /**
    * Fetch user list from the backend and merge in any locally stored secrets
    * so the UI can continue to generate portals without re-registering.
    */
-  const fetchUsers = async () => {
+  const fetchUsers = async (envName = selectedSnaptradeEnv) => {
     setLoading(true);
     setError(null);
     try {
       // Bypass any caches (browser/proxy/axios) to ensure we always show server truth.
       const res = await axios.get(`${API_BASE}/users`, {
-        params: { _ts: Date.now() },
+        params: { _ts: Date.now(), snaptradeEnv: envName },
         headers: {
           "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
           Pragma: "no-cache",
@@ -215,10 +519,12 @@ export default function AdminPanel() {
       // Always show the most up-to-date server list of users, but enrich with any locally stored secrets.
       const merged = (res.data || []).map((u) => ({
         ...u,
-        userSecret: u.userSecret || localSecrets?.[u.userId] || null,
+        userSecret: u.userSecret || localSecrets?.[envName]?.[u.userId] || null,
       }));
 
       setUsers(merged);
+      setRotationFeedback(null);
+      fetchUserConnectionStatuses(merged, envName);
     } catch (err) {
       console.error("API Error:", err);
 
@@ -243,8 +549,33 @@ export default function AdminPanel() {
           })`
         );
       }
+      setUsers([]);
+      setUserConnectionStatus({});
     }
     setLoading(false);
+  };
+
+  const refreshSelectedEnvironment = async (envName = selectedSnaptradeEnv) => {
+    setSelectedUser(null);
+    setConnectionUrl(null);
+    setConnectionErrorDetails(null);
+    setUserAccounts([]);
+    setAccountsError(null);
+    setSelectedBrokerageId(null);
+    setHoldingsUserId(null);
+    setHoldingsData(null);
+    setHoldingsError(null);
+    setHoldingsErrorDetails(null);
+
+    const nextConfig = await fetchAppConfig(envName);
+    if (!nextConfig?.availableEnvironments?.[envName]?.configured) {
+      setUsers([]);
+      setUserConnectionStatus({});
+      setError(`${getEnvironmentLabel(envName)} SnapTrade credentials are not configured yet.`);
+      return;
+    }
+
+    await fetchUsers(envName);
   };
 
   /**
@@ -255,7 +586,7 @@ export default function AdminPanel() {
     setBrokeragesError(null);
     try {
       const res = await axios.get(`${API_BASE}/brokerages`, {
-        params: { _ts: Date.now() },
+        params: { _ts: Date.now(), snaptradeEnv: selectedSnaptradeEnv },
         headers: {
           "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
           Pragma: "no-cache",
@@ -283,7 +614,7 @@ export default function AdminPanel() {
     setAccountsLoading(true);
     setAccountsError(null);
     try {
-      const userSecret = getLocalSecret(getSecretUserId(userId));
+      const userSecret = getLocalSecret(selectedSnaptradeEnv, getSecretUserId(userId));
       if (!userSecret) {
         setUserAccounts([]);
         setAccountsError(
@@ -296,6 +627,7 @@ export default function AdminPanel() {
       const res = await axios.post(`${API_BASE}/users/accounts`, {
         userId: effectiveUserId,
         userSecret,
+        snaptradeEnv: selectedSnaptradeEnv,
       });
       setUserAccounts(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
@@ -313,6 +645,7 @@ export default function AdminPanel() {
    * Uses the local userSecret and stores the returned redirect URL.
    */
   const generateConnection = async (userId) => {
+    setRotationFeedback(null);
     setConnectionLoading(true);
     const effectiveUserId = getEffectiveUserId(userId);
     setSelectedUser(effectiveUserId);
@@ -320,7 +653,7 @@ export default function AdminPanel() {
     setConnectionErrorDetails(null);
 
     try {
-      const userSecret = getLocalSecret(getSecretUserId(userId));
+      const userSecret = getLocalSecret(selectedSnaptradeEnv, getSecretUserId(userId));
       if (!userSecret) {
         alert("User secret not found locally. Please re-register this user.");
         setSelectedUser(null);
@@ -332,6 +665,7 @@ export default function AdminPanel() {
       const res = await axios.post(`${API_BASE}/users/login`, {
         userId: effectiveUserId,
         userSecret,
+        snaptradeEnv: selectedSnaptradeEnv,
       });
       setConnectionUrl(res.data.redirectURI);
 
@@ -372,12 +706,50 @@ export default function AdminPanel() {
   const deleteUser = async (userId) => {
     if (!window.confirm("Are you sure you want to delete this user?")) return;
     try {
-      await axios.delete(`${API_BASE}/users/${userId}`);
+      await axios.delete(`${API_BASE}/users/${userId}`, {
+        params: { snaptradeEnv: selectedSnaptradeEnv },
+      });
       alert(`Deleted ${userId}`);
       fetchUsers();
     } catch (err) {
       alert(`Failed to delete ${userId}`);
     }
+  };
+
+  const rotateUserSecret = async (userId) => {
+    setRotationFeedback(null);
+    setRotatingUserId(userId);
+
+    try {
+      const res = await axios.post(`${API_BASE}/users/rotate-secret`, {
+        userId,
+        snaptradeEnv: selectedSnaptradeEnv,
+      });
+
+      if (res.data?.userSecret) {
+        saveLocalSecret(selectedSnaptradeEnv, userId, res.data.userSecret);
+      }
+
+      setRotationFeedback({
+        type: "success",
+        message: `Rotated the userSecret for ${userId} in ${getEnvironmentLabel(selectedSnaptradeEnv)} and persisted it to Supabase.`,
+      });
+
+      await fetchUsers(selectedSnaptradeEnv);
+    } catch (err) {
+      const errorMessage =
+        err.response?.data?.error ||
+        err.response?.data?.message ||
+        err.message ||
+        "Failed to rotate user secret";
+
+      setRotationFeedback({
+        type: "error",
+        message: errorMessage,
+      });
+    }
+
+    setRotatingUserId(null);
   };
 
   /**
@@ -398,20 +770,21 @@ export default function AdminPanel() {
     try {
       const res = await axios.post(`${API_BASE}/users`, {
         userId: newUserId.trim(),
+        snaptradeEnv: selectedSnaptradeEnv,
       });
 
       // Persist userSecret locally so Generate Portal works even after backend restarts.
       if (res.data?.userId && res.data?.userSecret) {
-        saveLocalSecret(res.data.userId, res.data.userSecret);
+        saveLocalSecret(selectedSnaptradeEnv, res.data.userId, res.data.userSecret);
       }
 
       setRegisterSuccess(
-        `User registered successfully! User ID: ${res.data.userId}`
+        `User registered successfully in ${getEnvironmentLabel(selectedSnaptradeEnv)}. User ID: ${res.data.userId}`
       );
       setNewUserId("");
 
       // Refresh the users list
-      fetchUsers();
+      fetchUsers(selectedSnaptradeEnv);
     } catch (err) {
       console.error("Register Error:", err);
 
@@ -430,10 +803,9 @@ export default function AdminPanel() {
     setRegisterLoading(false);
   };
 
-  // Initial load: fetch the user list when the component mounts.
   useEffect(() => {
-    fetchUsers();
-  }, []);
+    refreshSelectedEnvironment(selectedSnaptradeEnv);
+  }, [selectedSnaptradeEnv]);
 
   /**
    * Fetch holdings for a specific account and render them in the UI.
@@ -449,7 +821,10 @@ export default function AdminPanel() {
     setSelectedBrokerageId(accountId);
     try {
       // We need: userSecret from the email userId, but request userId can be overridden.
-      const userSecret = getLocalSecret(getSecretUserId(userId));
+      const userSecret = getLocalSecret(
+        selectedSnaptradeEnv,
+        getSecretUserId(userId)
+      );
       if (!userSecret) {
         const err = new Error(
           `User secret not found locally for ${getSecretUserId(userId)}. Please re-register this user.`
@@ -467,6 +842,7 @@ export default function AdminPanel() {
         accountId,
         userId: effectiveUserId,
         userSecret,
+        snaptradeEnv: selectedSnaptradeEnv,
       });
       const data = res.data;
       setHoldingsData(data);
@@ -517,7 +893,19 @@ export default function AdminPanel() {
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <div className="flex items-start justify-between gap-4 mb-4">
-        <h1 className="text-2xl font-bold">Admin Panel - LookThroughProfits</h1>
+        <div>
+          <h1 className="text-2xl font-bold">Admin Panel - SnapTrade</h1>
+          <div className="mt-2 flex flex-wrap gap-2 text-xs">
+            <span className="inline-flex rounded-full bg-slate-900 px-2 py-1 font-semibold text-white">
+              SnapTrade {appMode}
+            </span>
+            {statusLoading && (
+              <span className="inline-flex rounded-full bg-amber-100 px-2 py-1 font-semibold text-amber-800">
+                Checking user connection states...
+              </span>
+            )}
+          </div>
+        </div>
 
         <div className="text-right">
           <label className="block text-xs font-medium text-gray-700">
@@ -546,6 +934,114 @@ export default function AdminPanel() {
         </p>
         <p>
           <strong>Source:</strong> Environment Variable (REACT_APP_API_BASE_URL)
+        </p>
+      </div>
+
+      <div className="mb-6 rounded-lg border border-slate-200 bg-slate-50 p-4">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">Environment Header</h2>
+            <p className="text-sm text-slate-600">
+              Select which SnapTrade environment the admin UI should use, then review the SnapTrade and Supabase credentials for that environment.
+            </p>
+          </div>
+          <button
+            className="rounded bg-slate-900 px-3 py-1 text-sm text-white hover:bg-slate-800 disabled:bg-slate-400"
+            onClick={() => refreshSelectedEnvironment(selectedSnaptradeEnv)}
+            disabled={configLoading}
+          >
+            {configLoading ? "Refreshing..." : "Refresh Header Info"}
+          </button>
+        </div>
+
+        {configError && <p className="mt-3 text-sm text-red-600">{configError}</p>}
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          {SNAPTRADE_ENV_OPTIONS.map((option) => {
+            const envConfig = appConfig?.availableEnvironments?.[option.value];
+            const isActive = selectedSnaptradeEnv === option.value;
+
+            return (
+              <button
+                key={option.value}
+                type="button"
+                className={`rounded-full px-3 py-1 text-sm font-semibold ${
+                  isActive
+                    ? "bg-slate-900 text-white"
+                    : "bg-white text-slate-700 border border-slate-300"
+                }`}
+                onClick={() => setSelectedSnaptradeEnv(option.value)}
+              >
+                {option.label}
+                {!envConfig?.configured ? " (not configured)" : ""}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-5">
+          <div className="rounded border bg-white p-3">
+            <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              SnapTrade Environment
+            </div>
+            <div className="mt-1 text-sm font-semibold text-slate-900">{appMode}</div>
+            <div className="mt-1 text-xs text-slate-600">
+              {selectedEnvironmentConfig?.configured
+                ? `${getEnvironmentLabel(selectedSnaptradeEnv)} credentials are configured.`
+                : `${getEnvironmentLabel(selectedSnaptradeEnv)} credentials are not configured yet.`}
+            </div>
+          </div>
+          <div className="rounded border bg-white p-3">
+            <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Client ID
+            </div>
+            <div className="mt-1 break-all font-mono text-sm text-slate-900">
+              {selectedEnvironmentConfig?.clientId || "Not configured"}
+            </div>
+          </div>
+          <div className="rounded border bg-white p-3">
+            <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Secret / Consumer Key
+            </div>
+            <div className="mt-1 break-all font-mono text-sm text-slate-900">
+              {selectedEnvironmentConfig?.consumerKey || "Not configured"}
+            </div>
+          </div>
+          <div className="rounded border bg-white p-3">
+            <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Supabase URL
+            </div>
+            <div className="mt-1 break-all font-mono text-sm text-slate-900">
+              {selectedEnvironmentConfig?.supabaseUrl || "Not configured"}
+            </div>
+          </div>
+          <div className="rounded border bg-white p-3">
+            <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Supabase Key
+            </div>
+            <div className="mt-1 break-all font-mono text-sm text-slate-900">
+              {selectedEnvironmentConfig?.supabaseKey || "Not configured"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {rotationFeedback && (
+        <div
+          className={`mb-6 rounded-lg border p-4 text-sm ${
+            rotationFeedback.type === "success"
+              ? "border-green-200 bg-green-50 text-green-800"
+              : "border-red-200 bg-red-50 text-red-800"
+          }`}
+        >
+          {rotationFeedback.message}
+        </div>
+      )}
+
+      <div className="mb-6 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+        <p className="font-semibold">What “Not available (re-register)” means</p>
+        <p className="mt-1">
+          SnapTrade knows the user exists, but this browser does not currently have that user’s local userSecret cached. Without that secret, the UI cannot generate a portal or fetch accounts for that user. Re-registering the user in this admin panel stores a fresh secret locally for this browser session.
         </p>
       </div>
 
@@ -632,7 +1128,7 @@ export default function AdminPanel() {
       {/* Refresh button */}
       <button
         className="mb-4 bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600"
-        onClick={fetchUsers}
+        onClick={() => refreshSelectedEnvironment(selectedSnaptradeEnv)}
         disabled={loading}
       >
         {loading ? "Loading..." : "Refresh Users"}
@@ -891,67 +1387,49 @@ export default function AdminPanel() {
         </div>
       )}
 
-      <table className="min-w-full bg-white border border-gray-300">
-        <thead>
-          <tr>
-            <th className="border px-4 py-2">User ID</th>
-            <th className="border px-4 py-2">User Secret</th>
-            <th className="border px-4 py-2">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {users.map((user, index) => (
-            <tr
-              key={user.userId}
-              className={selectedUser === user.userId ? "bg-blue-50" : ""}
-            >
-              <td className="border px-4 py-2">{user.userId}</td>
-              <td className="border px-4 py-2">
-                {user.userSecret ? (
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-xs bg-gray-100 px-2 py-1 rounded">
-                      {user.userSecret.substring(0, 8)}...
-                    </span>
-                    <button
-                      onClick={() =>
-                        navigator.clipboard.writeText(user.userSecret)
-                      }
-                      className="bg-gray-500 text-white px-2 py-1 rounded text-xs hover:bg-gray-600"
-                      title="Copy full secret"
-                    >
-                      Copy
-                    </button>
-                  </div>
-                ) : (
-                  <span className="text-red-500 text-sm">
-                    Not available (re-register)
-                  </span>
-                )}
-              </td>
-              <td className="border px-4 py-2 space-x-2">
-                <button
-                  className="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 disabled:bg-gray-400"
-                  onClick={() => generateConnection(user.userId)}
-                  disabled={
-                    (connectionLoading && selectedUser === user.userId) ||
-                    !user.userSecret
-                  }
-                >
-                  {connectionLoading && selectedUser === user.userId
-                    ? "Generating..."
-                    : "Generate Portal"}
-                </button>
-                <button
-                  className="bg-red-500 text-white px-3 py-1 rounded hover:bg-red-600"
-                  onClick={() => deleteUser(user.userId)}
-                >
-                  Delete
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="space-y-6">
+        <section>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold text-green-800">Connected Users</h2>
+              <p className="text-sm text-gray-600">
+                Users with at least one connected brokerage account returned by SnapTrade.
+              </p>
+            </div>
+            <div className="rounded-full bg-green-100 px-3 py-1 text-sm font-semibold text-green-800">
+              {connectedUsers.length}
+            </div>
+          </div>
+          {connectedUsers.length ? (
+            renderUserTable(connectedUsers)
+          ) : (
+            <div className="rounded border border-dashed border-gray-300 bg-white p-4 text-sm text-gray-600">
+              No connected users found yet.
+            </div>
+          )}
+        </section>
+
+        <section>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold text-slate-800">Disconnected Users</h2>
+              <p className="text-sm text-gray-600">
+                Users with no connected accounts yet or users missing a locally cached secret.
+              </p>
+            </div>
+            <div className="rounded-full bg-slate-100 px-3 py-1 text-sm font-semibold text-slate-700">
+              {disconnectedUsers.length}
+            </div>
+          </div>
+          {disconnectedUsers.length ? (
+            renderUserTable(disconnectedUsers)
+          ) : (
+            <div className="rounded border border-dashed border-gray-300 bg-white p-4 text-sm text-gray-600">
+              No disconnected users.
+            </div>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
